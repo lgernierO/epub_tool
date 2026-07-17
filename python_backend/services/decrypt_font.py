@@ -984,6 +984,10 @@ class FontDecrypt:
     def resolve_font_candidate(self, candidates):
         for candidate in candidates:
             normalized = self.normalize_font_name(candidate)
+            faces = (self.font_faces_by_family or {}).get(normalized) or []
+            if faces:
+                primary = self.font_to_font_family_mapping.get(normalized) or faces[-1].font_file
+                return primary, normalized
             if normalized in self.font_to_font_family_mapping:
                 return self.font_to_font_family_mapping[normalized], normalized
         return None, None
@@ -1883,6 +1887,21 @@ class FontDecrypt:
 
     def find_local_fonts_mapping(self):
         mapping = self.build_font_name_to_file_mapping()
+        faces_by_family = {}
+        self._font_face_order = 0
+
+        for family_name, font_file in mapping.items():
+            self._font_face_order += 1
+            append_font_face_candidate(
+                faces_by_family,
+                family=family_name,
+                font_file=font_file,
+                weight=DEFAULT_FONT_WEIGHT,
+                style=DEFAULT_FONT_STYLE,
+                order=self._font_face_order,
+                source_path=None,
+            )
+
         for css in self.css:
             try:
                 content = self.epub.read(css).decode("utf-8")
@@ -1893,6 +1912,7 @@ class FontDecrypt:
                 declarations = parse_declaration_list(rule.content)
                 font_family = None
                 src_urls = []
+                descriptors = extract_font_face_descriptor_values(declarations)
                 for declaration in declarations:
                     if declaration.type != "declaration":
                         continue
@@ -1910,11 +1930,31 @@ class FontDecrypt:
                 if not font_family:
                     continue
                 normalized = self.normalize_font_name(font_family)
+                selected_font_path = None
                 for one_url in src_urls:
                     font_path = self.resolve_book_path(css, one_url)
                     if font_path in self.fonts:
-                        mapping[normalized] = font_path
+                        selected_font_path = font_path
                         break
+                if not selected_font_path:
+                    continue
+                self._font_face_order += 1
+                append_font_face_candidate(
+                    faces_by_family,
+                    family=normalized,
+                    font_file=selected_font_path,
+                    weight=descriptors.get("weight"),
+                    style=descriptors.get("style"),
+                    unicode_ranges=descriptors.get("unicode_ranges"),
+                    order=self._font_face_order,
+                    source_path=css,
+                )
+                mapping[normalized] = selected_font_path
+
+        self.font_faces_by_family = faces_by_family
+        primary_mapping = build_primary_family_file_mapping(faces_by_family)
+        if primary_mapping:
+            mapping.update(primary_mapping)
         self.font_to_font_family_mapping = mapping
 
     def find_selector_to_font_mapping(self):
@@ -2455,6 +2495,82 @@ class FontDecrypt:
         return [rule_record]
 
     def get_effective_font_file(self, tag, css_font_rule_index):
+        selection = self.get_effective_font_selection(tag, css_font_rule_index)
+        if not selection:
+            return None
+        if selection is FONT_RULE_BLOCKER:
+            return FONT_RULE_BLOCKER
+        families = selection.get("families") or []
+        if not families:
+            return selection.get("font_file")
+        for family in families:
+            normalized = self.normalize_font_name(family)
+            if normalized in self.font_to_font_family_mapping:
+                return self.font_to_font_family_mapping[normalized]
+        return selection.get("font_file")
+
+    def extract_inline_font_weight_style(self, tag):
+        weight = None
+        style = None
+        if not tag or not tag.has_attr("style"):
+            return weight, style
+        for declaration in parse_declaration_list(tag.get("style", "")):
+            if getattr(declaration, "type", None) != "declaration":
+                continue
+            if declaration.lower_name == "font-weight":
+                parsed = extract_font_weight_from_tokens(declaration.value)
+                if parsed is not None:
+                    weight = parsed[0]
+            elif declaration.lower_name == "font-style":
+                parsed = extract_font_style_from_tokens(declaration.value)
+                if parsed is not None:
+                    style = parsed
+            elif declaration.lower_name == "font":
+                for token in declaration.value:
+                    token_type = getattr(token, "type", None)
+                    if token_type == "ident":
+                        value = str(token.value).lower()
+                        if value in {"italic", "oblique", "normal"} and style is None:
+                            style = parse_font_style_value(value)
+                        elif value in {"bold", "normal"} and weight is None:
+                            weight = parse_font_weight_value(value)[0]
+                    elif token_type == "number" and weight is None:
+                        try:
+                            weight = parse_font_weight_value(str(int(float(token.value))))[0]
+                        except Exception:
+                            pass
+        return weight, style
+
+    def get_computed_font_weight_style(self, tag):
+        weight = DEFAULT_FONT_WEIGHT
+        style = DEFAULT_FONT_STYLE
+        current = tag
+        found_weight = False
+        found_style = False
+        while current is not None and getattr(current, "name", None):
+            inline_weight, inline_style = self.extract_inline_font_weight_style(current)
+            if not found_weight and inline_weight is not None:
+                weight = inline_weight
+                found_weight = True
+            if not found_style and inline_style is not None:
+                style = inline_style
+                found_style = True
+            if found_weight and found_style:
+                break
+            class_names = current.get("class", []) if hasattr(current, "get") else []
+            if isinstance(class_names, str):
+                class_names = class_names.split()
+            lowered = {str(item).lower() for item in class_names}
+            if not found_weight and ("bold" in lowered or "fw-bold" in lowered):
+                weight = 700
+                found_weight = True
+            if not found_style and ("italic" in lowered or "em" in lowered):
+                style = "italic"
+                found_style = True
+            current = current.parent
+        return weight, style
+
+    def get_effective_font_selection(self, tag, css_font_rule_index):
         current = tag
         while current is not None and getattr(current, "name", None):
             rule_record = css_font_rule_index.get(id(current))
@@ -2469,9 +2585,38 @@ class FontDecrypt:
                 if rule_record.get("is_inherit"):
                     current = current.parent
                     continue
-                return rule_record["font_file"]
+                families = []
+                if rule_record.get("family"):
+                    families = [rule_record["family"]]
+                elif rule_record.get("font_file"):
+                    for family_name, font_file in self.font_to_font_family_mapping.items():
+                        if font_file == rule_record["font_file"]:
+                            families.append(family_name)
+                weight, style = self.get_computed_font_weight_style(tag)
+                return {
+                    "font_file": rule_record.get("font_file"),
+                    "families": families,
+                    "weight": weight,
+                    "style": style,
+                }
             current = current.parent
         return None
+
+    def resolve_font_file_for_char(self, selection, char):
+        if not selection or selection is FONT_RULE_BLOCKER:
+            return None
+        families = selection.get("families") or []
+        if families and self.font_faces_by_family:
+            selected = select_font_file_for_char(
+                self.font_faces_by_family,
+                families,
+                char,
+                requested_weight=selection.get("weight", DEFAULT_FONT_WEIGHT),
+                requested_style=selection.get("style", DEFAULT_FONT_STYLE),
+            )
+            if selected:
+                return selected
+        return selection.get("font_file")
 
     def find_char_mapping(self):
         mapping = {}
@@ -2490,14 +2635,17 @@ class FontDecrypt:
             )
             self.remove_cssselect2_markers(soup, marker_attr)
             for tag in soup.find_all(True):
-                font_file = self.get_effective_font_file(tag, css_font_rule_index)
-                if not font_file or not self.is_target_font_file(font_file):
+                selection = self.get_effective_font_selection(tag, css_font_rule_index)
+                if not selection or selection is FONT_RULE_BLOCKER:
                     continue
-                text = "".join(
-                    text_node.strip()
-                    for text_node in self.iter_direct_text_nodes(tag)
-                )
-                self.add_text_to_font_mapping(mapping, font_file, text)
+                for text_node in self.iter_direct_text_nodes(tag):
+                    for char in str(text_node):
+                        if char.isspace():
+                            continue
+                        font_file = self.resolve_font_file_for_char(selection, char)
+                        if not font_file or not self.is_target_font_file(font_file):
+                            continue
+                        self.add_text_to_font_mapping(mapping, font_file, char)
         self.font_to_char_mapping = mapping
 
     def get_mapping(self):
@@ -2715,11 +2863,21 @@ class FontDecrypt:
         )
         return placeholder
 
+    def get_ocr_batch_size(self):
+        raw = self.ocr_options.get("ocr_batch_size", 16)
+        try:
+            value = int(raw)
+        except Exception:
+            value = 16
+        return max(1, min(64, value))
+
     def build_ocr_mapping(self):
         backend = self.get_ocr_backend()
         threshold = self.get_min_ocr_confidence()
+        batch_size = self.get_ocr_batch_size()
         total_chars = sum(len(chars) for chars in self.font_to_char_mapping.values())
         processed_count = 0
+        glyph_cache = {}
 
         for font_path, chars in self.font_to_char_mapping.items():
             if not chars:
@@ -2732,52 +2890,105 @@ class FontDecrypt:
             renderer = FontGlyphRenderer(font_bytes, font_path, self.ocr_options)
             replace_table = {}
             failure_table = {}
-            for char in chars:
-                processed_count += 1
-                progress_text = format_ocr_progress(processed_count, total_chars)
-                image = None
-                try:
-                    image = renderer.render(char)
-                    result = backend.recognize(image, hint_char=char)
-                    period_like_glyph = renderer.is_period_like_image(image)
-                    text = self.normalize_ocr_text(
-                        result.text,
-                        hint_char=char,
-                        period_like_glyph=period_like_glyph,
-                    )
-                    if not text:
+            unique_chars = list(chars)
+            for start in range(0, len(unique_chars), batch_size):
+                batch_chars = unique_chars[start : start + batch_size]
+                images = []
+                render_errors = {}
+                for char in batch_chars:
+                    cache_key = (font_hash, char)
+                    if cache_key in glyph_cache:
+                        images.append(glyph_cache[cache_key])
+                        continue
+                    try:
+                        image = renderer.render(char)
+                        glyph_cache[cache_key] = image
+                        images.append(image)
+                    except Exception as exc:
+                        render_errors[char] = exc
+                        images.append(None)
+
+                runnable_indexes = [
+                    index for index, image in enumerate(images) if image is not None
+                ]
+                results_by_index = {}
+                if runnable_indexes:
+                    try:
+                        batch_results = backend.recognize_batch(
+                            [images[index] for index in runnable_indexes]
+                        )
+                        for offset, index in enumerate(runnable_indexes):
+                            results_by_index[index] = batch_results[offset]
+                    except Exception as batch_exc:
+                        # Fall back to single-image recognition for this batch.
+                        for index in runnable_indexes:
+                            try:
+                                results_by_index[index] = backend.recognize(
+                                    images[index],
+                                    hint_char=batch_chars[index],
+                                )
+                            except Exception as single_exc:
+                                render_errors[batch_chars[index]] = single_exc
+
+                for index, char in enumerate(batch_chars):
+                    processed_count += 1
+                    progress_text = format_ocr_progress(processed_count, total_chars)
+                    image = images[index]
+                    if char in render_errors or image is None:
                         replace_table[char] = self.record_ocr_failure(
                             failure_table,
                             char,
-                            OCR_EMPTY,
-                            f"OCR 为空，字体 {font_path}",
+                            OCR_EXCEPTION,
+                            f"OCR 异常: {render_errors.get(char, 'render failed')}，字体 {font_path}",
                             progress_text,
                             font_path=font_path,
                             font_hash=font_hash,
                             glyph_image=image,
                         )
                         continue
-                    if len(text) != 1:
-                        replace_table[char] = self.record_ocr_failure(
-                            failure_table,
-                            char,
-                            OCR_MULTI_CHAR,
-                            f"OCR 结果不是单字: {text}，字体 {font_path}",
-                            progress_text,
-                            font_path=font_path,
-                            font_hash=font_hash,
-                            glyph_image=image,
+                    try:
+                        result = results_by_index.get(index)
+                        if result is None:
+                            raise RuntimeError("OCR batch missing result")
+                        period_like_glyph = renderer.is_period_like_image(image)
+                        text = self.normalize_ocr_text(
+                            result.text,
+                            hint_char=char,
+                            period_like_glyph=period_like_glyph,
                         )
-                        continue
-                    if result.confidence is not None and result.confidence < threshold:
-                        replace_table[char] = self.record_ocr_failure(
-                            failure_table,
-                            char,
-                            OCR_LOW_CONF,
-                            (
-                                f"OCR 置信度过低: {result.confidence:.4f} "
-                                f"< {threshold:.4f}，字体 {font_path}"
-                            ),
+                        if not text:
+                            replace_table[char] = self.record_ocr_failure(
+                                failure_table,
+                                char,
+                                OCR_EMPTY,
+                                f"OCR 为空，字体 {font_path}",
+                                progress_text,
+                                font_path=font_path,
+                                font_hash=font_hash,
+                                glyph_image=image,
+                            )
+                            continue
+                        if len(text) != 1:
+                            replace_table[char] = self.record_ocr_failure(
+                                failure_table,
+                                char,
+                                OCR_MULTI_CHAR,
+                                f"OCR 结果不是单字: {text}，字体 {font_path}",
+                                progress_text,
+                                font_path=font_path,
+                                font_hash=font_hash,
+                                glyph_image=image,
+                            )
+                            continue
+                        if result.confidence is not None and result.confidence < threshold:
+                            replace_table[char] = self.record_ocr_failure(
+                                failure_table,
+                                char,
+                                OCR_LOW_CONF,
+                                (
+                                    f"OCR 置信度过低: {result.confidence:.4f} "
+                                    f"< {threshold:.4f}，字体 {font_path}"
+                                ),
                             progress_text,
                             font_path=font_path,
                             font_hash=font_hash,
