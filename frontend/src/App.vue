@@ -84,6 +84,13 @@ const normalizePythonWorkerAutoRestartLimit = (value: unknown): number => {
   }
   return Math.max(0, Math.min(5, Math.round(numeric)));
 };
+const normalizeTaskConcurrency = (value: unknown): number => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return defaultSettings.taskConcurrency;
+  }
+  return Math.max(1, Math.min(4, Math.round(numeric)));
+};
 const ocrCharPolicyOptions: Array<{
   value: OcrCharPolicy;
   label: string;
