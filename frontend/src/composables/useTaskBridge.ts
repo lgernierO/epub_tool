@@ -32,6 +32,21 @@ export function useTaskBridge() {
     });
   };
 
+  const cancelTask = async (taskId?: string | null): Promise<{
+    ok: boolean;
+    cancelled?: boolean;
+    forced?: boolean;
+    message?: string;
+    task_id?: string;
+  }> => {
+    if (!isTauriRuntime()) {
+      throw new Error("当前环境不支持该功能，请在桌面应用中使用。");
+    }
+    return invoke("cancel_epub_task", {
+      taskId: taskId ?? null,
+    });
+  };
+
   const listFontTargetsBatch = async (
     filePaths: string[],
     onEvent: (event: FontTargetProgressEvent) => void,
