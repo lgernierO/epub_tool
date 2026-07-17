@@ -49,7 +49,7 @@ class TaskControlTest(unittest.TestCase):
         with (
             patch.object(task_runner, "execute_task", side_effect=fake_execute_task),
             patch.object(task_runner, "patched_logger") as patched,
-            patch.object(task_runner, "mark_epub_generated_by_tool"),
+            patch("python_backend.epub_metadata.mark_epub_generated_by_tool"),
             patch.object(task_runner.os.path, "exists", return_value=True),
             patch.object(
                 task_runner,
