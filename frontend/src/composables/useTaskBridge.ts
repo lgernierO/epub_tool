@@ -144,6 +144,7 @@ export function useTaskBridge() {
   };
 
   return {
+    cancelTask,
     collectEpubFiles,
     getLogPath,
     getPersistedStorePath,
