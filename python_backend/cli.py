@@ -12,7 +12,12 @@ from typing import Any
 
 from python_backend.json_output import dumps_json_line
 from python_backend.protocol import TaskRequest
-from python_backend.task_runner import iter_font_targets, list_font_targets, run_task
+from python_backend.task_runner import (
+    iter_font_targets,
+    list_font_targets,
+    request_task_cancel,
+    run_task,
+)
 
 
 PARENT_LIVENESS_ADDR_ENV = "EPUB_TOOL_PARENT_LIVENESS_ADDR"
@@ -164,6 +169,24 @@ def cmd_serve(_args: argparse.Namespace) -> int:
                     raise ValueError("run 请求缺少 request 对象")
                 result = run_task(load_request_from_payload(request_payload))
                 emit_worker_response(request_id, result=result.to_dict())
+            elif command == "cancel":
+                task_id = pick_payload_value(payload, "task_id", "taskId")
+                if not task_id:
+                    raise ValueError("cancel 请求缺少 task_id/taskId")
+                cancelled = request_task_cancel(str(task_id))
+                emit_worker_response(
+                    request_id,
+                    result={
+                        "ok": True,
+                        "task_id": str(task_id),
+                        "cancelled": bool(cancelled),
+                        "message": (
+                            "已发送取消信号，将在当前文件边界停止"
+                            if cancelled
+                            else "未找到可取消的运行中任务"
+                        ),
+                    },
+                )
             elif command == "list-fonts-batch":
                 input_files = payload.get("input_files")
                 if not isinstance(input_files, list):
