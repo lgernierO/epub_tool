@@ -141,6 +141,38 @@ class WorkerProtocolTest(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["result"]["status"], "success")
 
+    def test_serve_handles_cancel_command(self):
+        original_stdin = sys.stdin
+        original_stdout = sys.stdout
+        sys.stdin = io.StringIO(
+            json.dumps(
+                {
+                    "request_id": "cancel-1",
+                    "command": "cancel",
+                    "task_id": "task-42",
+                }
+            )
+            + "\n"
+        )
+        output = io.StringIO()
+        sys.stdout = output
+        try:
+            with (
+                patch.object(cli, "request_task_cancel", return_value=True) as cancel,
+                patch.object(cli, "start_parent_monitor"),
+            ):
+                self.assertEqual(cli.cmd_serve(None), 0)
+                cancel.assert_called_once_with("task-42")
+        finally:
+            sys.stdin = original_stdin
+            sys.stdout = original_stdout
+
+        response = json.loads(output.getvalue())
+        self.assertEqual(response["event"], "worker.response")
+        self.assertEqual(response["request_id"], "cancel-1")
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["result"]["cancelled"])
+
     def test_ocr_backend_is_reused_for_same_model_configuration(self):
         decrypt_font._OCR_BACKEND_CACHE.clear()
         options = {"onnx_max_image_width": 640}
