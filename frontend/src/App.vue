@@ -274,14 +274,6 @@ const normalizeSettings = (value: unknown): AppSettings => {
   };
 };
 
-const normalizeTaskConcurrency = (value: unknown): number => {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) {
-    return defaultSettings.taskConcurrency;
-  }
-  return Math.max(1, Math.min(4, Math.round(numeric)));
-};
-
 const normalizeOcrCharPolicy = (value: unknown): OcrCharPolicy =>
   ocrCharPolicies.includes(value as OcrCharPolicy)
     ? (value as OcrCharPolicy)
