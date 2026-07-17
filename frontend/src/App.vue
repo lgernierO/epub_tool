@@ -75,6 +75,7 @@ const defaultSettings: AppSettings = {
   autoCheckUpdates: true,
   keepHistoryCount: 10,
   pythonWorkerAutoRestartLimit: 2,
+  taskConcurrency: 1,
 };
 const normalizePythonWorkerAutoRestartLimit = (value: unknown): number => {
   const numeric = Number(value);
@@ -143,6 +144,7 @@ let brandEasterResetTimer = 0;
 let brandEasterHideTimer = 0;
 
 const {
+  cancelTask,
   collectEpubFiles,
   getLogPath,
   getPersistedStorePath,
@@ -259,7 +261,18 @@ const normalizeSettings = (value: unknown): AppSettings => {
     pythonWorkerAutoRestartLimit: normalizePythonWorkerAutoRestartLimit(
       raw.pythonWorkerAutoRestartLimit,
     ),
+    taskConcurrency: normalizeTaskConcurrency(
+      (raw as { taskConcurrency?: unknown }).taskConcurrency,
+    ),
   };
+};
+
+const normalizeTaskConcurrency = (value: unknown): number => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return defaultSettings.taskConcurrency;
+  }
+  return Math.max(1, Math.min(4, Math.round(numeric)));
 };
 
 const normalizeOcrCharPolicy = (value: unknown): OcrCharPolicy =>
@@ -1749,8 +1762,13 @@ const buildRequest = (): TaskRequest => {
     options: {},
   };
 
+  request.options = {
+    task_concurrency: normalizeTaskConcurrency(settings.value.taskConcurrency),
+  };
+
   if (isFontTargetTask(activeTask.value)) {
     request.options = {
+      ...request.options,
       target_font_families_by_file: Object.fromEntries(
         files.value.map((item) => [item.path, item.selectedFontFamilies]),
       ),
@@ -1764,6 +1782,7 @@ const buildRequest = (): TaskRequest => {
       ...(request.options ?? {}),
       ocr_char_policy: normalizedSettings.ocrCharPolicy,
       min_ocr_confidence: normalizedSettings.minOcrConfidence,
+      ocr_batch_size: 16,
     };
   }
 
@@ -1963,6 +1982,25 @@ const pushLog = (event: TaskEvent) => {
   }
 };
 
+const activeRunningTaskId = ref<string | null>(null);
+const taskCancelling = ref(false);
+
+const cancelSelectedTask = async () => {
+  if (!taskRunning.value || taskCancelling.value) {
+    return;
+  }
+  taskCancelling.value = true;
+  taskStatus.value = "正在取消当前任务…";
+  try {
+    const result = await cancelTask(activeRunningTaskId.value);
+    taskStatus.value = result.message || "已请求取消当前任务";
+  } catch (error) {
+    taskStatus.value = toErrorMessage(error, "取消任务失败");
+  } finally {
+    taskCancelling.value = false;
+  }
+};
+
 const runSelectedTask = async () => {
   if (files.value.length === 0 || taskRunning.value || !activeTask.value) {
     return;
@@ -1982,6 +2020,7 @@ const runSelectedTask = async () => {
   taskLogsByType.value[taskType] = [];
   taskResultByType.value[taskType] = createRunningTaskResult(files.value.length);
   const request = buildRequest();
+  activeRunningTaskId.value = request.taskId;
 
   try {
     const taskResult = await runTask(request, pushLog);
@@ -1989,21 +2028,28 @@ const runSelectedTask = async () => {
     syncQueueWithResult(taskType, taskResult);
     rememberTask(request.taskType, taskResult);
     maybeOpenFollowUpTargets(taskResult);
-    taskStatus.value = taskResult.ok ? "任务完成" : "任务结束，但存在失败项";
+    if (taskResult.status === "cancelled") {
+      taskStatus.value = "任务已取消";
+    } else {
+      taskStatus.value = taskResult.ok ? "任务完成" : "任务结束，但存在失败项";
+    }
   } catch (error) {
     const message = toErrorMessage(error, "执行过程中出现未知错误");
+    const looksCancelled =
+      /取消|cancel|terminated|意外退出|重启处理引擎/i.test(message);
     logs.value.push({
-      event: "task.bridge.error",
-      task_id: "local",
-      status: "error",
+      event: looksCancelled ? "task.cancelled" : "task.bridge.error",
+      task_id: activeRunningTaskId.value || "local",
+      status: looksCancelled ? "cancelled" : "error",
       progress: progress.value,
-      message,
-      level: "error",
+      message: looksCancelled ? "任务已取消" : message,
+      level: looksCancelled ? "warning" : "error",
     });
-    taskStatus.value = message;
+    taskStatus.value = looksCancelled ? "任务已取消" : message;
   } finally {
     taskRunning.value = false;
     runningTaskType.value = null;
+    activeRunningTaskId.value = null;
     taskProgressCurrent.value = 0;
     taskProgressTotal.value = 0;
     taskProgressFileName.value = "";
@@ -2483,10 +2529,20 @@ activeSection.value = normalizeSectionKey(activeSection.value);
                         </p>
                       </div>
 
-                      <button class="primary-btn wide" :disabled="taskRunning || files.length === 0" type="button"
-                        @click="runSelectedTask">
-                        {{ taskRunning ? "处理中..." : "开始执行" }}
-                      </button>
+                      <div class="task-action-row">
+                        <button class="primary-btn wide" :disabled="taskRunning || files.length === 0" type="button"
+                          @click="runSelectedTask">
+                          {{ taskRunning ? "处理中..." : "开始执行" }}
+                        </button>
+                        <button
+                          class="ghost-btn wide"
+                          :disabled="!taskRunning || taskCancelling"
+                          type="button"
+                          @click="cancelSelectedTask"
+                        >
+                          {{ taskCancelling ? "取消中..." : "停止任务" }}
+                        </button>
+                      </div>
                     </div>
                   </article>
 
