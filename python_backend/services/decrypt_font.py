@@ -2989,32 +2989,32 @@ class FontDecrypt:
                                     f"OCR 置信度过低: {result.confidence:.4f} "
                                     f"< {threshold:.4f}，字体 {font_path}"
                                 ),
+                                progress_text,
+                                font_path=font_path,
+                                font_hash=font_hash,
+                                glyph_image=image,
+                            )
+                            continue
+                        replace_table[char] = text
+                        confidence_text = (
+                            f"，置信度 {result.confidence:.4f}"
+                            if result.confidence is not None
+                            else ""
+                        )
+                        logger.write(
+                            f"字体{font_path}字符 U+{ord(char):04X} -> {text}{confidence_text}{progress_text}"
+                        )
+                    except Exception as exc:
+                        replace_table[char] = self.record_ocr_failure(
+                            failure_table,
+                            char,
+                            OCR_EXCEPTION,
+                            f"OCR 异常: {exc}，字体 {font_path}",
                             progress_text,
                             font_path=font_path,
                             font_hash=font_hash,
                             glyph_image=image,
                         )
-                        continue
-                    replace_table[char] = text
-                    confidence_text = (
-                        f"，置信度 {result.confidence:.4f}"
-                        if result.confidence is not None
-                        else ""
-                    )
-                    logger.write(
-                        f"字体{font_path}字符 U+{ord(char):04X} -> {text}{confidence_text}{progress_text}"
-                    )
-                except Exception as exc:
-                    replace_table[char] = self.record_ocr_failure(
-                        failure_table,
-                        char,
-                        OCR_EXCEPTION,
-                        f"OCR 异常: {exc}，字体 {font_path}",
-                        progress_text,
-                        font_path=font_path,
-                        font_hash=font_hash,
-                        glyph_image=image,
-                    )
             self.font_to_replace_mapping[font_path] = replace_table
             self.font_to_ocr_failure_mapping[font_path] = failure_table
 
