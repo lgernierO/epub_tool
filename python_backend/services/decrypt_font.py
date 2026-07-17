@@ -3463,21 +3463,35 @@ class FontDecrypt:
             self.remove_cssselect2_markers(soup, marker_attr)
 
             for tag in soup.find_all(True):
-                font_file = self.get_effective_font_file(tag, css_font_rule_index)
-                if not font_file or not self.is_target_font_file(font_file):
+                selection = self.get_effective_font_selection(tag, css_font_rule_index)
+                if not selection or selection is FONT_RULE_BLOCKER:
                     continue
-                replace_table = self.font_to_replace_mapping.get(font_file, {})
-                if not replace_table:
-                    continue
-                failure_table = self.font_to_ocr_failure_mapping.get(font_file, {})
                 for text_node in list(self.iter_direct_text_nodes(tag)):
+                    original = str(text_node)
+                    if not original:
+                        continue
+                    # Build a per-node replace table so unicode-range splits stay accurate.
+                    node_replace_table = {}
+                    node_failure_table = {}
+                    for char in original:
+                        font_file = self.resolve_font_file_for_char(selection, char)
+                        if not font_file or not self.is_target_font_file(font_file):
+                            continue
+                        replace_table = self.font_to_replace_mapping.get(font_file, {})
+                        if char in replace_table:
+                            node_replace_table[char] = replace_table[char]
+                        failure_table = self.font_to_ocr_failure_mapping.get(font_file, {})
+                        if char in failure_table:
+                            node_failure_table[char] = failure_table[char]
+                    if not node_replace_table:
+                        continue
                     has_ocr_failure_markup = (
                         self.replace_text_node(
                             soup,
                             one_html,
                             text_node,
-                            replace_table,
-                            failure_table,
+                            node_replace_table,
+                            node_failure_table,
                         )
                         or has_ocr_failure_markup
                     )
