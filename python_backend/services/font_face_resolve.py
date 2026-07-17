@@ -188,10 +188,13 @@ def select_font_face_for_char(
     if not faces:
         return None
 
+    # Only faces that cover the character are eligible. If none cover it,
+    # return None so the caller can fall back to the next family/candidate
+    # instead of polluting an uncovered face mapping.
     covering = [face for face in faces if unicode_range_covers(face.unicode_ranges, char)]
-    pool = covering or list(faces)
-    if not pool:
+    if not covering:
         return None
+    pool = covering
 
     def sort_key(face: FontFaceCandidate):
         return (
