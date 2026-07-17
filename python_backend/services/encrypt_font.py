@@ -27,6 +27,35 @@ try:
 except:
     from log import logwriter
 
+try:
+    from python_backend.services.font_face_resolve import (
+        DEFAULT_FONT_STYLE,
+        DEFAULT_FONT_WEIGHT,
+        append_font_face_candidate,
+        build_primary_family_file_mapping,
+        extract_font_face_descriptor_values,
+        extract_font_style_from_tokens,
+        extract_font_weight_from_tokens,
+        normalize_font_family_name,
+        parse_font_style_value,
+        parse_font_weight_value,
+        select_font_file_for_char,
+    )
+except Exception:
+    from font_face_resolve import (
+        DEFAULT_FONT_STYLE,
+        DEFAULT_FONT_WEIGHT,
+        append_font_face_candidate,
+        build_primary_family_file_mapping,
+        extract_font_face_descriptor_values,
+        extract_font_style_from_tokens,
+        extract_font_weight_from_tokens,
+        normalize_font_family_name,
+        parse_font_style_value,
+        parse_font_weight_value,
+        select_font_file_for_char,
+    )
+
 logger = logwriter()
 
 FONT_OBFUSCATION_EAST_ASIAN_WIDTHS = frozenset({"W", "F"})
@@ -214,6 +243,8 @@ class FontEncrypt:
         self.ori_files = []
         self.missing_chars = []
         self.font_to_font_family_mapping = {}
+        self.font_faces_by_family = {}
+        self._font_face_order = 0
         self.css_selector_to_font_mapping = {}
         self.css_selector_font_rules = []
         self._css_selector_rule_order = 0
@@ -369,7 +400,7 @@ class FontEncrypt:
             logger.write(f"opf_malformed_fallback_used: encrypt_font ({e})")
 
     def normalize_font_name(self, name):
-        return re.sub(r"\s+", " ", (name or "").strip().strip("'\"")).lower()
+        return normalize_font_family_name(name)
 
     def resolve_book_path(self, base_path, href):
         href = (href or "").strip().strip("'\"").split("#")[0].split("?")[0]
@@ -647,6 +678,11 @@ class FontEncrypt:
     def resolve_font_candidate(self, candidates):
         for candidate in candidates:
             normalized = self.normalize_font_name(candidate)
+            faces = (self.font_faces_by_family or {}).get(normalized) or []
+            if faces:
+                # Keep cascade at family level; character-level face selection happens later.
+                primary = self.font_to_font_family_mapping.get(normalized) or faces[-1].font_file
+                return primary, normalized
             if normalized in self.font_to_font_family_mapping:
                 return self.font_to_font_family_mapping[normalized], normalized
         return None, None
@@ -1555,6 +1591,23 @@ class FontEncrypt:
 
     def find_local_fonts_mapping(self):
         mapping = self.build_font_name_to_file_mapping()
+        faces_by_family = {}
+        self._font_face_order = 0
+
+        # Seed candidates from embedded font metadata/file names so books without
+        # @font-face still keep a stable family -> file fallback.
+        for family_name, font_file in mapping.items():
+            self._font_face_order += 1
+            append_font_face_candidate(
+                faces_by_family,
+                family=family_name,
+                font_file=font_file,
+                weight=DEFAULT_FONT_WEIGHT,
+                style=DEFAULT_FONT_STYLE,
+                order=self._font_face_order,
+                source_path=None,
+            )
+
         for css in self.css:
             with self.epub.open(css) as f:
                 content = f.read().decode("utf-8")
@@ -1563,6 +1616,7 @@ class FontEncrypt:
                     declarations = parse_declaration_list(rule.content)
                     font_family = None
                     src_urls = []
+                    descriptors = extract_font_face_descriptor_values(declarations)
                     for declaration in declarations:
                         if declaration.type != "declaration":
                             continue
@@ -1580,11 +1634,33 @@ class FontEncrypt:
                     if not font_family:
                         continue
                     normalized = self.normalize_font_name(font_family)
+                    selected_font_path = None
                     for one_url in src_urls:
                         font_path = self.resolve_book_path(css, one_url)
                         if font_path in self.fonts:
-                            mapping[normalized] = font_path
+                            selected_font_path = font_path
                             break
+                    if not selected_font_path:
+                        continue
+                    self._font_face_order += 1
+                    append_font_face_candidate(
+                        faces_by_family,
+                        family=normalized,
+                        font_file=selected_font_path,
+                        weight=descriptors.get("weight"),
+                        style=descriptors.get("style"),
+                        unicode_ranges=descriptors.get("unicode_ranges"),
+                        order=self._font_face_order,
+                        source_path=css,
+                    )
+                    # Keep legacy single-file mapping as the latest primary face.
+                    mapping[normalized] = selected_font_path
+
+        self.font_faces_by_family = faces_by_family
+        # Prefer structured primary faces (normal/400 when available).
+        primary_mapping = build_primary_family_file_mapping(faces_by_family)
+        if primary_mapping:
+            mapping.update(primary_mapping)
         self.font_to_font_family_mapping = mapping
 
     def find_selector_to_font_mapping(self):
@@ -2161,6 +2237,85 @@ class FontEncrypt:
         return [rule_record]
 
     def get_effective_font_file(self, tag, css_font_rule_index):
+        selection = self.get_effective_font_selection(tag, css_font_rule_index)
+        if not selection:
+            return None
+        if selection is FONT_RULE_BLOCKER:
+            return FONT_RULE_BLOCKER
+        families = selection.get("families") or []
+        if not families:
+            return selection.get("font_file")
+        # Backward-compatible tag-level file: primary face of first matched family.
+        for family in families:
+            normalized = self.normalize_font_name(family)
+            if normalized in self.font_to_font_family_mapping:
+                return self.font_to_font_family_mapping[normalized]
+        return selection.get("font_file")
+
+    def extract_inline_font_weight_style(self, tag):
+        weight = None
+        style = None
+        if not tag or not tag.has_attr("style"):
+            return weight, style
+        for declaration in parse_declaration_list(tag.get("style", "")):
+            if getattr(declaration, "type", None) != "declaration":
+                continue
+            if declaration.lower_name == "font-weight":
+                parsed = extract_font_weight_from_tokens(declaration.value)
+                if parsed is not None:
+                    weight = parsed[0]
+            elif declaration.lower_name == "font-style":
+                parsed = extract_font_style_from_tokens(declaration.value)
+                if parsed is not None:
+                    style = parsed
+            elif declaration.lower_name == "font":
+                # Minimal shorthand support: scan idents/numbers before family size token.
+                for token in declaration.value:
+                    token_type = getattr(token, "type", None)
+                    if token_type == "ident":
+                        value = str(token.value).lower()
+                        if value in {"italic", "oblique", "normal"} and style is None:
+                            style = parse_font_style_value(value)
+                        elif value in {"bold", "normal"} and weight is None:
+                            weight = parse_font_weight_value(value)[0]
+                    elif token_type == "number" and weight is None:
+                        try:
+                            weight = parse_font_weight_value(str(int(float(token.value))))[0]
+                        except Exception:
+                            pass
+        return weight, style
+
+    def get_computed_font_weight_style(self, tag):
+        weight = DEFAULT_FONT_WEIGHT
+        style = DEFAULT_FONT_STYLE
+        current = tag
+        found_weight = False
+        found_style = False
+        while current is not None and getattr(current, "name", None):
+            inline_weight, inline_style = self.extract_inline_font_weight_style(current)
+            if not found_weight and inline_weight is not None:
+                weight = inline_weight
+                found_weight = True
+            if not found_style and inline_style is not None:
+                style = inline_style
+                found_style = True
+            if found_weight and found_style:
+                break
+            # Common EPUB class conventions: bold / italic in class names.
+            class_names = current.get("class", []) if hasattr(current, "get") else []
+            if isinstance(class_names, str):
+                class_names = class_names.split()
+            lowered = {str(item).lower() for item in class_names}
+            if not found_weight and ("bold" in lowered or "fw-bold" in lowered):
+                weight = 700
+                found_weight = True
+            if not found_style and ("italic" in lowered or "em" in lowered):
+                style = "italic"
+                found_style = True
+            current = current.parent
+        return weight, style
+
+    def get_effective_font_selection(self, tag, css_font_rule_index):
         current = tag
         while current is not None and getattr(current, "name", None):
             rule_record = css_font_rule_index.get(id(current))
@@ -2175,9 +2330,38 @@ class FontEncrypt:
                 if rule_record.get("is_inherit"):
                     current = current.parent
                     continue
-                return rule_record["font_file"]
+                families = []
+                if rule_record.get("family"):
+                    families = [rule_record["family"]]
+                elif rule_record.get("font_file"):
+                    for family_name, font_file in self.font_to_font_family_mapping.items():
+                        if font_file == rule_record["font_file"]:
+                            families.append(family_name)
+                weight, style = self.get_computed_font_weight_style(tag)
+                return {
+                    "font_file": rule_record.get("font_file"),
+                    "families": families,
+                    "weight": weight,
+                    "style": style,
+                }
             current = current.parent
         return None
+
+    def resolve_font_file_for_char(self, selection, char):
+        if not selection or selection is FONT_RULE_BLOCKER:
+            return None
+        families = selection.get("families") or []
+        if families and self.font_faces_by_family:
+            selected = select_font_file_for_char(
+                self.font_faces_by_family,
+                families,
+                char,
+                requested_weight=selection.get("weight", DEFAULT_FONT_WEIGHT),
+                requested_style=selection.get("style", DEFAULT_FONT_STYLE),
+            )
+            if selected:
+                return selected
+        return selection.get("font_file")
 
     def find_char_mapping(self):
         mapping = {}
@@ -2194,14 +2378,17 @@ class FontEncrypt:
                 )
                 self.remove_cssselect2_markers(soup, marker_attr)
                 for tag in soup.find_all(True):
-                    font_file = self.get_effective_font_file(tag, css_font_rule_index)
-                    if not font_file or not self.is_target_font_file(font_file):
+                    selection = self.get_effective_font_selection(tag, css_font_rule_index)
+                    if not selection or selection is FONT_RULE_BLOCKER:
                         continue
-                    text = "".join(
-                        text_node.strip()
-                        for text_node in self.iter_direct_text_nodes(tag)
-                    )
-                    self.add_text_to_font_mapping(mapping, font_file, text)
+                    for text_node in self.iter_direct_text_nodes(tag):
+                        for char in str(text_node):
+                            if char.isspace():
+                                continue
+                            font_file = self.resolve_font_file_for_char(selection, char)
+                            if not font_file or not self.is_target_font_file(font_file):
+                                continue
+                            self.add_text_to_font_mapping(mapping, font_file, char)
         self.font_to_char_mapping = mapping
 
     def get_mapping(self):
@@ -2476,19 +2663,25 @@ class FontEncrypt:
             self.remove_cssselect2_markers(soup, marker_attr)
 
             for tag in soup.find_all(True):
-                font_file = self.get_effective_font_file(tag, css_font_rule_index)
-                if not font_file or not self.is_target_font_file(font_file):
+                selection = self.get_effective_font_selection(tag, css_font_rule_index)
+                if not selection or selection is FONT_RULE_BLOCKER:
                     continue
-                replace_table = self.font_to_char_mapping.get(font_file, {})
-                if not replace_table:
-                    continue
-                char_replace_table = {
-                    source: self.decode_hex_entity(target)
-                    for source, target in replace_table.items()
-                }
-                trans_table = str.maketrans(char_replace_table)
                 for text_node in list(self.iter_direct_text_nodes(tag)):
-                    text_node.replace_with(text_node.translate(trans_table))
+                    original = str(text_node)
+                    if not original:
+                        continue
+                    replaced_chars = []
+                    changed = False
+                    for char in original:
+                        font_file = self.resolve_font_file_for_char(selection, char)
+                        replace_table = self.font_to_char_mapping.get(font_file, {}) if font_file else {}
+                        if isinstance(replace_table, dict) and char in replace_table:
+                            replaced_chars.append(self.decode_hex_entity(replace_table[char]))
+                            changed = True
+                        else:
+                            replaced_chars.append(char)
+                    if changed:
+                        text_node.replace_with("".join(replaced_chars))
             # 使用 minimal formatter：
             # 1) 会对文本中的 < / & 等进行最小必要转义，避免 &lt;script&gt; 变回真实标签导致 XHTML 结构损坏；
             # 2) 不会像 html formatter 那样把 … / — 等字符广泛替换为命名实体。
