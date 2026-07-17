@@ -80,6 +80,8 @@ struct PythonWorkerStore {
     worker: Mutex<Option<PythonWorker>>,
     // The active child stays separately accessible while stdout is being read under `worker`.
     active_child: Mutex<Option<Arc<Mutex<Child>>>>,
+    // Soft-cancel target for the currently running task request id.
+    active_task_id: Mutex<Option<String>>,
     manual_restart_requested: AtomicBool,
     // Invalidates queued automatic recoveries whenever a newer start or restart begins.
     recovery_epoch: AtomicU64,
@@ -922,6 +924,12 @@ fn terminate_active_worker(store: &PythonWorkerStore) -> Result<PythonWorkerStat
     Ok(status.clone())
 }
 
+fn set_active_task_id(store: &PythonWorkerStore, task_id: Option<String>) {
+    if let Ok(mut active_task_id) = store.active_task_id.lock() {
+        *active_task_id = task_id;
+    }
+}
+
 fn execute_worker_request(
     app: &AppHandle,
     store: &PythonWorkerStore,
@@ -933,6 +941,21 @@ fn execute_worker_request(
         .and_then(Value::as_str)
         .ok_or_else(|| "worker 请求缺少 request_id".to_string())?
         .to_string();
+    let command = request
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let tracked_task_id = if command == "run" {
+        request
+            .get("request")
+            .and_then(|value| value.get("taskId").or_else(|| value.get("task_id")))
+            .and_then(Value::as_str)
+            .map(|value| value.to_string())
+            .or_else(|| Some(request_id.clone()))
+    } else {
+        None
+    };
     let request_line = serde_json::to_string(&request)
         .map_err(|error| format!("序列化 worker 请求失败: {error}"))?;
     let mut worker_slot = store
@@ -953,6 +976,9 @@ fn execute_worker_request(
         .map(|worker| Arc::clone(&worker.child))
         .ok_or_else(|| "Python worker 未初始化".to_string())?;
     set_active_worker_child(store, Some(active_child));
+    if let Some(task_id) = tracked_task_id.clone() {
+        set_active_task_id(store, Some(task_id));
+    }
 
     let result = (|| -> Result<Value, String> {
         let worker = worker_slot
@@ -1007,6 +1033,9 @@ fn execute_worker_request(
         }
     })();
     set_active_worker_child(store, None);
+    if tracked_task_id.is_some() {
+        set_active_task_id(store, None);
+    }
 
     if let Err(error) = &result {
         if let Some(worker) = worker_slot.as_mut() {
@@ -1394,6 +1423,54 @@ async fn run_epub_task(
     .map_err(|error| format!("异步任务失败: {error}"))?
 }
 
+#[tauri::command]
+async fn cancel_epub_task(app: AppHandle, task_id: Option<String>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let store = app.state::<PythonWorkerStore>();
+        let resolved_task_id = match task_id.filter(|value| !value.trim().is_empty()) {
+            Some(value) => value,
+            None => store
+                .inner()
+                .active_task_id
+                .lock()
+                .map_err(|_| "Python worker 活动任务锁已损坏".to_string())?
+                .clone()
+                .ok_or_else(|| "当前没有可取消的运行中任务".to_string())?,
+        };
+
+        // Soft cancel first: ask the Python worker to stop at the next file boundary.
+        let soft_result = execute_worker_request(
+            &app,
+            store.inner(),
+            json!({
+                "request_id": worker_request_id("cancel"),
+                "command": "cancel",
+                "task_id": resolved_task_id,
+            }),
+            &Channel::new(|_| Ok(())),
+        );
+
+        match soft_result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                // Fallback: terminate the current worker process tree if soft cancel cannot run.
+                if let Ok(mut status) = terminate_active_worker(store.inner()) {
+                    status.message = format!("软取消失败，已强制终止处理引擎：{error}");
+                    return Ok(json!({
+                        "ok": true,
+                        "cancelled": true,
+                        "forced": true,
+                        "message": status.message,
+                    }));
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
+    .map_err(|error| format!("异步取消任务失败: {error}"))?
+}
+
 fn setup_window_effects(app: &tauri::App) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
@@ -1432,6 +1509,7 @@ fn main() {
             app.manage(PythonWorkerStore {
                 worker: Mutex::new(None),
                 active_child: Mutex::new(None),
+                active_task_id: Mutex::new(None),
                 manual_restart_requested: AtomicBool::new(false),
                 recovery_epoch: AtomicU64::new(0),
                 status: Mutex::new(PythonWorkerStatus::default()),
@@ -1447,6 +1525,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            cancel_epub_task,
             collect_epub_files,
             get_log_path,
             get_persisted_store_path,
