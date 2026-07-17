@@ -83,6 +83,8 @@ export interface AppSettings {
   autoCheckUpdates: boolean;
   keepHistoryCount: number;
   pythonWorkerAutoRestartLimit: number;
+  /** Safe task concurrency for non-OCR tasks (1-4). */
+  taskConcurrency: number;
 }
 
 export interface PythonWorkerStatus {
