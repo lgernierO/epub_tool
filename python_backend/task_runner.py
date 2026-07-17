@@ -553,7 +553,14 @@ def run_task(request: TaskRequest) -> TaskResult:
         with patched_logger(request.task_type, logger):
             if concurrency <= 1:
                 for index, input_file in enumerate(request.input_files, start=1):
-                    ensure_not_cancelled(request.task_id, cancel_event)
+                    if is_task_cancelled(request.task_id, cancel_event):
+                        cancelled.append(
+                            {
+                                "input_file": os.path.normpath(input_file),
+                                "message": "任务已取消",
+                            }
+                        )
+                        break
                     status, payload, _expected, _duration, _message = _process_one_file(
                         request=request,
                         emitter=emitter,
