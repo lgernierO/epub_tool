@@ -1435,37 +1435,20 @@ async fn cancel_epub_task(app: AppHandle, task_id: Option<String>) -> Result<Val
                 .lock()
                 .map_err(|_| "Python worker 活动任务锁已损坏".to_string())?
                 .clone()
-                .ok_or_else(|| "当前没有可取消的运行中任务".to_string())?,
+                .unwrap_or_else(|| "unknown".to_string()),
         };
 
-        // Soft cancel first: ask the Python worker to stop at the next file boundary.
-        let soft_result = execute_worker_request(
-            &app,
-            store.inner(),
-            json!({
-                "request_id": worker_request_id("cancel"),
-                "command": "cancel",
-                "task_id": resolved_task_id,
-            }),
-            &Channel::new(|_| Ok(())),
-        );
-
-        match soft_result {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                // Fallback: terminate the current worker process tree if soft cancel cannot run.
-                if let Ok(mut status) = terminate_active_worker(store.inner()) {
-                    status.message = format!("软取消失败，已强制终止处理引擎：{error}");
-                    return Ok(json!({
-                        "ok": true,
-                        "cancelled": true,
-                        "forced": true,
-                        "message": status.message,
-                    }));
-                }
-                Err(error)
-            }
-        }
+        // The worker processes stdin requests sequentially. While a task is running it
+        // cannot read a soft-cancel command, so cancellation terminates the active
+        // process tree and lets recovery restart a clean worker.
+        let status = terminate_active_worker(store.inner())?;
+        Ok(json!({
+            "ok": true,
+            "cancelled": true,
+            "forced": true,
+            "task_id": resolved_task_id,
+            "message": status.message,
+        }))
     })
     .await
     .map_err(|error| format!("异步取消任务失败: {error}"))?
