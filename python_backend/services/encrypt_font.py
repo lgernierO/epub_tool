@@ -694,6 +694,12 @@ class FontEncrypt:
             return True
         if matched_family and matched_family in self.target_font_families:
             return True
+        # Any face under a selected family is in scope, not only the primary file.
+        for family_name, faces in (self.font_faces_by_family or {}).items():
+            if family_name not in self.target_font_families:
+                continue
+            if any(face.font_file == font_file for face in faces):
+                return True
         return any(
             family_name in self.target_font_families and mapped_file == font_file
             for family_name, mapped_file in self.font_to_font_family_mapping.items()
