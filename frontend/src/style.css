@@ -1036,6 +1036,16 @@ input {
   gap: var(--layout-gap-2);
 }
 
+.task-action-row {
+  display: grid;
+  gap: var(--layout-gap-2);
+}
+
+.task-action-row .primary-btn.wide,
+.task-action-row .ghost-btn.wide {
+  width: 100%;
+}
+
 .primary-btn,
 .secondary-btn,
 .ghost-btn {
