@@ -29,6 +29,35 @@ try:
 except Exception:
     from log import logwriter
 
+try:
+    from python_backend.services.font_face_resolve import (
+        DEFAULT_FONT_STYLE,
+        DEFAULT_FONT_WEIGHT,
+        append_font_face_candidate,
+        build_primary_family_file_mapping,
+        extract_font_face_descriptor_values,
+        extract_font_style_from_tokens,
+        extract_font_weight_from_tokens,
+        normalize_font_family_name,
+        parse_font_style_value,
+        parse_font_weight_value,
+        select_font_file_for_char,
+    )
+except Exception:
+    from font_face_resolve import (
+        DEFAULT_FONT_STYLE,
+        DEFAULT_FONT_WEIGHT,
+        append_font_face_candidate,
+        build_primary_family_file_mapping,
+        extract_font_face_descriptor_values,
+        extract_font_style_from_tokens,
+        extract_font_weight_from_tokens,
+        normalize_font_family_name,
+        parse_font_style_value,
+        parse_font_weight_value,
+        select_font_file_for_char,
+    )
+
 logger = logwriter()
 
 DEFAULT_OCR_MODEL_NAME = "PP-OCRv6_small_rec"
@@ -189,13 +218,41 @@ class OnnxGlyphOcrBackend:
         self.max_img_width = int(options.get("onnx_max_image_width") or 3200)
 
     def recognize(self, image, hint_char=""):
-        tensor = self.preprocess_image(image)
-        outputs = self.session.run(None, {self.input_name: tensor})
-        if not outputs:
-            return OcrTextResult("")
-        return self.decode_prediction(outputs[0])
+        results = self.recognize_batch([image])
+        return results[0] if results else OcrTextResult("")
 
-    def preprocess_image(self, image):
+    def recognize_batch(self, images):
+        images = list(images or [])
+        if not images:
+            return []
+        if len(images) == 1:
+            tensor = self.preprocess_image(images[0])
+            outputs = self.session.run(None, {self.input_name: tensor})
+            if not outputs:
+                return [OcrTextResult("")]
+            return [self.decode_prediction(outputs[0], index=0)]
+
+        tensors = [self.preprocess_image(image, expand_batch=False) for image in images]
+        # Pad each sample to the max width in this batch so ONNX can run once.
+        max_width = max(tensor.shape[-1] for tensor in tensors)
+        batch = self.np.zeros(
+            (len(tensors), tensors[0].shape[0], tensors[0].shape[1], max_width),
+            dtype=self.np.float32,
+        )
+        for index, tensor in enumerate(tensors):
+            batch[index, :, :, : tensor.shape[-1]] = tensor
+        outputs = self.session.run(None, {self.input_name: batch})
+        if not outputs:
+            return [OcrTextResult("") for _ in images]
+        prediction = self.np.array(outputs[0])
+        if prediction.ndim == 2:
+            prediction = self.np.expand_dims(prediction, axis=0)
+        return [
+            self.decode_prediction(prediction, index=index)
+            for index in range(len(images))
+        ]
+
+    def preprocess_image(self, image, expand_batch=True):
         img_c, img_h, img_w = self.image_shape
         if img_c != 3:
             raise RuntimeError(f"暂不支持非 3 通道 OCR 输入: {self.image_shape}")
@@ -221,16 +278,20 @@ class OnnxGlyphOcrBackend:
 
         padded = self.np.zeros((img_c, img_h, target_w), dtype=self.np.float32)
         padded[:, :, :resized_w] = resized
-        return self.np.expand_dims(padded, axis=0)
+        if expand_batch:
+            return self.np.expand_dims(padded, axis=0)
+        return padded
 
-    def decode_prediction(self, prediction):
+    def decode_prediction(self, prediction, index=0):
         preds = self.np.array(prediction)
         if preds.ndim == 2:
             preds = self.np.expand_dims(preds, axis=0)
         if preds.ndim != 3:
             raise RuntimeError(f"OCR ONNX 输出维度无效: {preds.shape}")
+        if index < 0 or index >= preds.shape[0]:
+            raise RuntimeError(f"OCR ONNX 输出索引无效: {index} / {preds.shape[0]}")
 
-        pred = preds[0]
+        pred = preds[index]
         token_ids = pred.argmax(axis=-1)
         token_scores = pred.max(axis=-1)
         chars = []
@@ -515,6 +576,8 @@ class FontDecrypt:
         self.fonts = []
         self.ori_files = []
         self.font_to_font_family_mapping = {}
+        self.font_faces_by_family = {}
+        self._font_face_order = 0
         self.css_selector_to_font_mapping = {}
         self.css_selector_font_rules = []
         self._css_selector_rule_order = 0
@@ -643,7 +706,7 @@ class FontDecrypt:
             logger.write(f"opf_malformed_fallback_used: decrypt_font ({e})")
 
     def normalize_font_name(self, name):
-        return re.sub(r"\s+", " ", (name or "").strip().strip("'\"")).lower()
+        return normalize_font_family_name(name)
 
     def resolve_book_path(self, base_path, href):
         href = (href or "").strip().strip("'\"").split("#")[0].split("?")[0]
