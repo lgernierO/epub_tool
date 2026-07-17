@@ -36,8 +36,19 @@ Vue 组件
 - `paddle`、`paddleocr`、`paddlex` 不进入冻结产物；Paddle 依赖只用于维护者刷新已提交 ONNX 模型的转换阶段。
 - OCR 模型资源默认固定为 `ocr-models/PP-OCRv6_small_rec_onnx/`，Rust 启动后端时通过 `EPUB_TOOL_OCR_ONNX_MODEL_DIR` 注入；`EPUB_TOOL_OCR_MODEL_NAME=PP-OCRv6_medium_rec` 可用于本地高准确率档验证。
 
+## 任务取消
+
+- 前端可调用 `cancel_epub_task`
+- 由于 worker 串行读取 stdin，运行中的 `run` 请求无法再消费 soft-cancel 命令
+- 因此当前取消实现会终止活动 worker 进程树，并触发自动恢复重启
+- Python `task_runner` 仍保留文件边界上的 soft-cancel 标记，便于未来双通道协议演进
+
+## 任务并发
+
+- `options.task_concurrency`（1-4）可加速 `reformat` / `decrypt` / `encrypt` / `transfer_img`
+- `font_encrypt` / `font_decrypt` 固定串行，避免 OCR 与全局 logger 状态冲突
+
 ## 当前限制
 
 - sidecar 需要在构建机额外安装 `pyinstaller`
 - ONNX 模型转换仅用于维护已提交模型，需要在 `conda epub_tool` 环境中额外安装 `requirements/requirements-ocr-conversion.txt`
-- 还未做任务取消
