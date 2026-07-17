@@ -2916,6 +2916,21 @@ activeSection.value = normalizeSectionKey(activeSection.value);
                   </div>
                   <input v-model.number="settings.keepHistoryCount" min="1" max="30" type="number" />
                 </label>
+                <label
+                  class="settings-preference-card settings-preference-card-number settings-interactive-card glass-medium">
+                  <div>
+                    <strong>任务并发数</strong>
+                    <p>仅对格式化/加解密/图片转换生效，字体 OCR 任务始终串行。</p>
+                  </div>
+                  <input
+                    v-model.number="settings.taskConcurrency"
+                    min="1"
+                    max="4"
+                    step="1"
+                    type="number"
+                    @change="settings.taskConcurrency = normalizeTaskConcurrency(settings.taskConcurrency)"
+                  />
+                </label>
               </div>
             </section>
 
